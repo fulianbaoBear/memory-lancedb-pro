@@ -2318,8 +2318,25 @@ const memoryLanceDBProPlugin = {
     } = singleton;
 
 
-    async function sleep(ms: number): Promise<void> {
-      await new Promise(resolve => setTimeout(resolve, ms));
+    async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+      if (signal?.aborted) {
+        throw signal.reason ?? new Error("aborted");
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+          cleanup();
+          resolve();
+        }, ms);
+        const onAbort = () => {
+          cleanup();
+          reject(signal?.reason ?? new Error("aborted"));
+        };
+        const cleanup = () => {
+          clearTimeout(timeoutId);
+          signal?.removeEventListener("abort", onAbort);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
     }
 
     async function retrieveWithRetry(params: {
@@ -2328,10 +2345,11 @@ const memoryLanceDBProPlugin = {
       scopeFilter?: string[];
       category?: string;
       source?: "manual" | "auto-recall" | "cli";
+      signal?: AbortSignal;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
-        await sleep(75);
+        await sleep(75, params.signal);
         results = await retriever.retrieve(params);
       }
       return results;
@@ -2890,6 +2908,7 @@ const memoryLanceDBProPlugin = {
             limit: retrieveLimit,
             scopeFilter: accessibleScopes,
             source: "auto-recall",
+            signal: autoRecallAbortController.signal,
           }), config.workspaceBoundary);
 
           if (shouldDropLateAutoRecall("post-retrieve")) return;
@@ -3148,13 +3167,26 @@ const memoryLanceDBProPlugin = {
           };
         };
 
+        const autoRecallAbortController = new AbortController();
         let timeoutId: ReturnType<typeof setTimeout> | undefined;
         try {
+          const recallPromise = recallWork().then((r) => {
+            clearTimeout(timeoutId);
+            return r;
+          }).catch((err) => {
+            if (autoRecallTimedOut && autoRecallAbortController.signal.aborted) {
+              return undefined;
+            }
+            throw err;
+          });
           const result = await Promise.race([
-            recallWork().then((r) => { clearTimeout(timeoutId); return r; }),
+            recallPromise,
             new Promise<undefined>((resolve) => {
               timeoutId = setTimeout(() => {
                 autoRecallTimedOut = true;
+                autoRecallAbortController.abort(new Error(
+                  `auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms`,
+                ));
                 api.logger.warn(
                   `memory-lancedb-pro: auto-recall timed out after ${AUTO_RECALL_TIMEOUT_MS}ms; skipping memory injection to avoid stalling agent startup`,
                 );
